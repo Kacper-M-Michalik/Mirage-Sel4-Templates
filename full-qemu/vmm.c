@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdalign.h>
 #include <microkit.h>
 #include <sddf/util/util.h>
 #include <sddf/util/printf.h>
@@ -13,6 +14,7 @@
 #include <solo5libvmm/guest.h>
 #include <solo5libvmm/fault.h>
 #include <solo5libvmm/solo5/hvt_abi.h>
+#include <solo5libvmm/solo5/mft_abi.h>
 #include <solo5libvmm/util.h>
 
 // SDDF provides driver configs through named sections
@@ -36,7 +38,15 @@ extern size_t _binary_guest_size[]; // Doesn't work without []
 uint32_t guest_vcpu_id = 0;
 uint8_t* guest_ram_vaddr = (uint8_t*)0x30000000;
 size_t guest_ram_size= 0x10000000;
-bool waiting_for_timeout = false;
+
+enum status 
+{
+    NONE,
+    TIMEOUT,
+    BLOCK_READ,
+    BLOCK_WRITE
+};
+enum status vmm_status = NONE;
 
 // Provide printf() for solo5libvmm
 int printf(const char *fmt, ...) 
@@ -65,7 +75,7 @@ void init(void)
     blk_queue_init(&blk_queue, blk_config.virt.req_queue.vaddr, blk_config.virt.resp_queue.vaddr, blk_config.virt.num_buffers);
     blk_storage_info_t* storage_info = blk_config.virt.storage_info.vaddr;
     while (!blk_storage_is_ready(storage_info));
-    printf("Block device ready (size=%ld bytes)\n", storage_info->capacity * BLK_TRANSFER_SIZE);
+    printf("Block device ready (sector_size=%ld, sectors=%ld, size=%ld bytes)\n", BLK_TRANSFER_SIZE, storage_info->capacity, storage_info->capacity * BLK_TRANSFER_SIZE);
 
     // Boot up guest
     printf("Guest memory addr: %zu\n", guest_ram_vaddr);
@@ -74,7 +84,17 @@ void init(void)
     printf("Starting bootup\n");
 
     char cmdline[] = "";
-    bool success = guest_setup(guest_vcpu_id, _binary_guest_start, (size_t)_binary_guest_size, guest_ram_vaddr, guest_ram_size, 0, cmdline, strlen(cmdline));
+    
+    alignas(MFT1_NOTE_ALIGN) uint8_t mft_buff[MFT1_NOTE_MAX_SIZE];
+    size_t mft_size;
+    load_mft(_binary_guest_start, (size_t)_binary_guest_size, mft_buff, &mft_size);
+
+    struct mft* mft = (struct mft*)mft_buff;
+    mft->e[1].attached = true;
+    mft->e[1].u.block_basic.block_size = BLK_TRANSFER_SIZE;
+    mft->e[1].u.block_basic.capacity = (storage_info->capacity-1) * BLK_TRANSFER_SIZE;
+
+    bool success = guest_setup_with_mft(guest_vcpu_id, _binary_guest_start, (size_t)_binary_guest_size, guest_ram_vaddr, guest_ram_size, 0, cmdline, strlen(cmdline), mft_buff, mft_size);
     printf("Load success: %d\n", success);
 
     if (success) guest_resume(guest_vcpu_id);
@@ -88,21 +108,43 @@ void notified(microkit_channel ch)
 
     if (ch == timer_config.driver_id) // We got a notification about an elapsed timer, which we use to implement the poll hypercall
     {
-        assert(waiting_for_timeout);
+        assert(vmm_status == TIMEOUT);
+        vmm_status = NONE;
 
-        waiting_for_timeout = false;
-        guest_resume(guest_vcpu_id);
-        
+        guest_resume(guest_vcpu_id);        
         return;
     }
  
     if (ch == blk_config.virt.id) // We got response from the block device driver
     {
-        printf("Got response from block\n");
+        assert(vmm_status == BLOCK_READ || vmm_status == BLOCK_WRITE);
+        
+        blk_resp_status_t status = -1;
+        uint16_t count = -1;
+        uint32_t id = -1;
+        int err = blk_dequeue_resp(&blk_queue, &status, &count, &id);
+        assert(!err);
+        assert(status == BLK_RESP_OK);
+        assert(count == 1);
+        assert(id == 0);
+        printf("Got block response!\n");
+
+        if (vmm_status == BLOCK_READ)
+        {
+
+            // Copy data into guest
+            //uint8_t* read_data = (uint8_t*)(blk_config.data.vaddr + (REQUEST_NUM_BLOCKS * BLK_TRANSFER_SIZE));
+            //for (int i = 0; i < basic_data_len; i++) 
+            //{
+            //}
+        }
+
+        vmm_status = NONE;
+        guest_resume(guest_vcpu_id);        
         return;
     }
 
-    printf("Unexpected channel, ch: 0x%lx\n", ch);  
+    printf("Unexpected channel, ch: 0x%lx, vmm status: %ld\n", ch, vmm_status);  
 }
 
 seL4_Bool fault(microkit_child child, microkit_msginfo msginfo, microkit_msginfo *reply_msginfo) 
@@ -132,7 +174,7 @@ seL4_Bool fault(microkit_child child, microkit_msginfo msginfo, microkit_msginfo
             struct hvt_hc_poll* poll = (struct hvt_hc_poll*)hc_data;
             poll->ready_set = 0;
             poll->ret = 0;
-            waiting_for_timeout = true;
+            vmm_status = TIMEOUT;
             sddf_timer_set_timeout(timer_config.driver_id, poll->timeout_nsecs);  
             break;   
 
@@ -147,11 +189,33 @@ seL4_Bool fault(microkit_child child, microkit_msginfo msginfo, microkit_msginfo
             break;  
 
         case HVT_HYPERCALL_BLOCK_READ:
+            struct hvt_hc_block_read* b_read = (struct hvt_hc_block_read*)hc_data;
+            printf("Block Read hc (handle=%ld, size=%ld, offset=%ld, buff=%ld)\n", b_read->handle, b_read->len, b_read->offset, b_read->data);
+            
+            vmm_status == BLOCK_READ;
+            assert(b_read->len == BLK_TRANSFER_SIZE);
+            assert(b_read->offset % BLK_TRANSFER_SIZE == 0);
+
+            int err = blk_enqueue_req(&blk_queue, BLK_REQ_READ, 0, b_read->offset / BLK_TRANSFER_SIZE, 1, 0);
+            assert(!err);
+            microkit_notify(blk_config.virt.id);
+            break;
 
         case HVT_HYPERCALL_BLOCK_WRITE:
             struct hvt_hc_block_write* b_write = (struct hvt_hc_block_write*)hc_data;
-            printf("Block Read hc (handle=%ld, size=%ld, offset=%ld, buff=%ld)\n", b_write->handle, b_write->len, b_write->offset, b_write->data);
-            //microkit_notify(blk_config.virt.id);
+            printf("Block Write hc (handle=%ld, size=%ld, offset=%ld, buff=%ld)\n", b_write->handle, b_write->len, b_write->offset, b_write->data);
+            
+            vmm_status = BLOCK_WRITE;
+            assert(b_write->len <= BLK_TRANSFER_SIZE);
+            assert(b_write->offset % BLK_TRANSFER_SIZE == 0);
+            
+            uint8_t* data_dest = (uint8_t*)blk_config.data.vaddr;
+            memcpy(data_dest, (guest_ram_vaddr + b_write->data), b_write->len);
+            err = blk_enqueue_req(&blk_queue, BLK_REQ_WRITE, 0, b_write->offset / BLK_TRANSFER_SIZE, 1, 0);
+            assert(!err);
+            microkit_notify(blk_config.virt.id);
+            break;
+            
         case HVT_HYPERCALL_NET_READ:
         case HVT_HYPERCALL_NET_WRITE:
         default:
